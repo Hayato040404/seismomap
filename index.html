@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>強震モニタ グリッド検知 (Modern UI)</title>
+    
+    <!-- Tailwind CSS (Design) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Leaflet (Map) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    
+    <!-- FontAwesome (Icons) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <style>
+        /* カスタムスタイル */
+        body { font-family: 'Helvetica Neue', Arial, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans', Meiryo, sans-serif; }
+        
+        /* 地図レイヤーのz-index調整 */
+        .leaflet-container { background: #eef2f5; z-index: 1; }
+        
+        /* EEWアラートのアニメーション */
+        @keyframes flash-alert {
+            0% { background-color: rgba(220, 38, 38, 0.95); }
+            100% { background-color: rgba(185, 28, 28, 0.9); }
+        }
+        .animate-flash { animation: flash-alert 1s infinite alternate; }
+
+        /* グラスモーフィズムパネル */
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.5);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        /* 震源アイコン */
+        .epicenter-icon {
+            color: #ef4444; /* red-500 */
+            font-size: 24px;
+            font-weight: 900;
+            text-align: center;
+            line-height: 24px;
+            text-shadow: 0 0 4px rgba(255,255,255,1);
+            animation: pulse-icon 1s infinite;
+        }
+        @keyframes pulse-icon {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        /* スクロールバーのカスタマイズ */
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* モバイルでのタップ領域確保 */
+        select { -webkit-appearance: none; appearance: none; }
+    </style>
+</head>
+<body class="h-[100dvh] w-full overflow-hidden relative text-slate-700 bg-slate-100">
+
+    <!-- Map Container -->
+    <div id="map" class="absolute inset-0 z-0"></div>
+
+    <!-- EEW Overlay (Top Full Width) -->
+    <div id="eew-banner" class="absolute top-0 left-0 w-full z-50 hidden animate-flash text-white shadow-lg pointer-events-none">
+        <div class="max-w-4xl mx-auto p-3 flex flex-col md:flex-row items-center justify-between pointer-events-auto">
+            <div class="flex items-center gap-3 mb-1 md:mb-0">
+                <i class="fa-solid fa-triangle-exclamation text-yellow-300 text-2xl animate-bounce"></i>
+                <div>
+                    <div class="font-bold text-lg leading-tight">緊急地震速報 (予報)</div>
+                    <div id="eew-region" class="text-xl font-black">---</div>
+                </div>
+            </div>
+            <div class="flex gap-4 text-sm md:text-base bg-red-900/30 px-3 py-1 rounded-lg">
+                <div class="flex flex-col items-center">
+                    <span class="text-xs text-red-100">マグニチュード</span>
+                    <span class="font-bold text-xl">M<span id="eew-mag">-.-</span></span>
+                </div>
+                <div class="w-px bg-red-300/50"></div>
+                <div class="flex flex-col items-center">
+                    <span class="text-xs text-red-100">最大震度</span>
+                    <span class="font-bold text-xl" id="eew-maxint">-</span>
+                </div>
+                <div class="w-px bg-red-300/50"></div>
+                <div class="flex flex-col items-center">
+                    <span class="text-xs text-red-100">深さ</span>
+                    <span class="font-bold text-xl"><span id="eew-depth">-</span></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main UI Container (Pointer events passed through) -->
+    <div class="absolute inset-0 z-40 pointer-events-none flex flex-col justify-between p-2 md:p-4">
+        
+        <!-- Header & Status (Top) -->
+        <div class="flex justify-between items-start pointer-events-auto">
+            <!-- App Title & Clock -->
+            <div class="glass-panel rounded-lg p-3 flex flex-col gap-1 max-w-[200px] md:max-w-xs">
+                <h1 class="text-xs font-bold text-slate-500 uppercase tracking-wider">Earthquake Grid Monitor</h1>
+                <div id="data-time" class="text-lg md:text-2xl font-mono font-bold leading-none text-slate-800">--:--:--</div>
+                <div id="date-display" class="text-xs text-slate-500 font-mono">----/--/--</div>
+            </div>
+
+            <!-- Status Indicator -->
+            <div class="flex flex-col gap-2 items-end">
+                <div id="mode-display" class="glass-panel px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide flex items-center gap-2 text-green-600 bg-green-50/90 border-green-200">
+                    <span class="relative flex h-2 w-2">
+                      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                      <span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                    </span>
+                    LIVE
+                </div>
+                <div id="fetch-status" class="glass-panel px-2 py-1 rounded text-[10px] text-slate-400">待機中</div>
+            </div>
+        </div>
+
+        <!-- Controls & Info Panels (Bottom) -->
+        <div class="flex flex-col md:flex-row gap-2 items-end md:items-end pointer-events-auto">
+            
+            <!-- Mobile Toggle Button (Visible only on mobile) -->
+            <button id="mobile-toggle" onclick="toggleMobileMenu()" class="md:hidden glass-panel h-10 w-10 rounded-full flex items-center justify-center text-slate-600 shadow-md mb-2">
+                <i class="fa-solid fa-layer-group"></i>
+            </button>
+
+            <!-- Left Panel: Lists (Hidden on mobile initially) -->
+            <div id="info-panel" class="hidden md:flex flex-col gap-2 w-full md:w-80 transition-all duration-300">
+                
+                <!-- Event List -->
+                <div class="glass-panel rounded-xl overflow-hidden shadow-lg flex flex-col max-h-[150px] md:max-h-[200px]">
+                    <div class="bg-slate-100/80 px-3 py-2 border-b border-slate-200 flex justify-between items-center">
+                        <h3 class="text-xs font-bold text-slate-600 uppercase"><i class="fa-solid fa-bullseye mr-1"></i> グリッド検知</h3>
+                    </div>
+                    <div id="event-list" class="p-2 overflow-y-auto custom-scrollbar text-sm space-y-2 h-full bg-white/50">
+                        <div class="text-slate-400 text-center py-4 text-xs">検知なし</div>
+                    </div>
+                </div>
+
+                <!-- Intensity List -->
+                <div class="glass-panel rounded-xl overflow-hidden shadow-lg flex flex-col max-h-[150px] md:max-h-[250px]">
+                    <div class="bg-slate-100/80 px-3 py-2 border-b border-slate-200 flex justify-between items-center">
+                        <h3 class="text-xs font-bold text-slate-600 uppercase"><i class="fa-solid fa-map-pin mr-1"></i> 観測点 (震度1+)</h3>
+                        <span id="site-count" class="bg-slate-200 text-slate-600 px-1.5 rounded text-[10px]">0</span>
+                    </div>
+                    <div id="intensity-content" class="p-0 overflow-y-auto custom-scrollbar h-full bg-white/50">
+                        <div class="text-slate-400 text-center py-4 text-xs">データ待機中...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel: Controls -->
+            <div id="control-panel" class="hidden md:block w-full md:w-80 glass-panel rounded-xl p-4 shadow-xl">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="font-bold text-slate-700 text-sm"><i class="fa-solid fa-sliders mr-1"></i> コントロール</h2>
+                    <button id="btn-audio" onclick="toggleAudio()" class="text-xs px-3 py-1.5 rounded-full border border-slate-300 bg-white hover:bg-slate-50 transition-colors flex items-center gap-1.5 text-slate-500">
+                        <i class="fa-solid fa-volume-xmark"></i> OFF
+                    </button>
+                </div>
+
+                <!-- Date Picker -->
+                <div class="mb-3">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">日付 (YYYY/MM/DD)</label>
+                    <div class="flex gap-1">
+                        <div class="relative flex-1">
+                            <select id="sel-year" onchange="updateDayOptions()" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-4 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono"></select>
+                            <i class="fa-solid fa-chevron-down absolute right-2 top-3 text-[10px] text-slate-400 pointer-events-none"></i>
+                        </div>
+                        <div class="relative w-20">
+                            <select id="sel-month" onchange="updateDayOptions()" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-4 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono"></select>
+                            <i class="fa-solid fa-chevron-down absolute right-2 top-3 text-[10px] text-slate-400 pointer-events-none"></i>
+                        </div>
+                        <div class="relative w-20">
+                            <select id="sel-day" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-4 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono"></select>
+                            <i class="fa-solid fa-chevron-down absolute right-2 top-3 text-[10px] text-slate-400 pointer-events-none"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Time Picker -->
+                <div class="mb-4">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">開始時刻 (HH:MM:SS)</label>
+                    <div class="flex items-center gap-1">
+                        <div class="relative flex-1">
+                            <select id="sel-hour" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-2 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono text-center"></select>
+                        </div>
+                        <span class="text-slate-400 font-bold">:</span>
+                        <div class="relative flex-1">
+                            <select id="sel-min" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-2 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono text-center"></select>
+                        </div>
+                        <span class="text-slate-400 font-bold">:</span>
+                        <div class="relative flex-1">
+                            <select id="sel-sec" class="w-full bg-white border border-slate-300 text-slate-700 text-sm rounded-lg p-2 pr-2 focus:ring-2 focus:ring-blue-500 outline-none appearance-none font-mono text-center"></select>
+                        </div>
+                    </div>
+                    <button onclick="setPresetTime(5)" class="mt-2 w-full text-xs text-blue-500 hover:text-blue-700 py-1 font-medium hover:bg-blue-50 rounded transition-colors">
+                        <i class="fa-solid fa-clock-rotate-left mr-1"></i> 現在時刻の5分前をセット
+                    </button>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="flex gap-2">
+                    <button id="btn-play" onclick="startReplay()" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-4 rounded-lg shadow transition-colors flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-play"></i> 再生
+                    </button>
+                    <button id="btn-stop" onclick="stopReplay()" class="hidden flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-2.5 px-4 rounded-lg shadow transition-colors flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-stop"></i> 停止
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Script Logic -->
+    <script>
+        // ==========================================
+        // Config & Constants
+        // ==========================================
+        const CONFIG = {
+            GRID_SIZE: 0.5, HISTORY_FRAMES: 4, MIN_ACTIVITY_THRESHOLD: 5.0, 
+            RISE_THRESHOLD: 0.5, NEIGHBOR_REQ: 1, NOISE_FILTER: true, UPDATE_INTERVAL: 1000
+        };
+
+        const EVENT_LEVELS = {
+            PRE:     { min: 5.0, label: '微弱', color: '#cbd5e1', tailwind: 'bg-slate-300 border-slate-400', soundFreq: 0 },
+            SHINDO1: { min: 6.0, label: '震度1', color: '#97b7cc', tailwind: 'bg-sky-200 border-sky-400 text-sky-900', soundFreq: 400 },
+            SHINDO2: { min: 8.0, label: '震度2', color: '#00a0e9', tailwind: 'bg-blue-200 border-blue-500 text-blue-900', soundFreq: 500 },
+            SHINDO3: { min: 10.0, label: '震度3', color: '#0040ff', tailwind: 'bg-blue-600 border-blue-700 text-white', soundFreq: 600 },
+            SHINDO4: { min: 12.0, label: '震度4', color: '#fa0', tailwind: 'bg-amber-400 border-amber-600 text-amber-900', soundFreq: 800 },
+            SHINDO5: { min: 14.0, label: '震度5+', color: '#ff2800', tailwind: 'bg-red-600 border-red-800 text-white', soundFreq: 1000 }
+        };
+
+        let isReplayMode = false;
+        let replayCurrentTime = null;
+        let isMobileMenuOpen = false;
+
+        // ==========================================
+        // UI Logic
+        // ==========================================
+        
+        // モバイルメニュー切り替え
+        function toggleMobileMenu() {
+            const panel = document.getElementById('control-panel');
+            const info = document.getElementById('info-panel');
+            isMobileMenuOpen = !isMobileMenuOpen;
+            
+            if (isMobileMenuOpen) {
+                // Open
+                panel.classList.remove('hidden');
+                info.classList.remove('hidden');
+                // モバイル向けに配置調整
+                panel.classList.add('absolute', 'bottom-0', 'left-0', 'right-0', 'rounded-b-none', 'z-50');
+                info.classList.add('absolute', 'bottom-[340px]', 'left-2', 'right-2', 'z-40');
+            } else {
+                // Close
+                panel.classList.add('hidden');
+                info.classList.add('hidden');
+                // クラスリセット
+                panel.classList.remove('absolute', 'bottom-0', 'left-0', 'right-0', 'rounded-b-none', 'z-50');
+                info.classList.remove('absolute', 'bottom-[340px]', 'left-2', 'right-2', 'z-40');
+            }
+        }
+
+        function initSelectors() {
+            const selYear = document.getElementById('sel-year');
+            const currentYear = new Date().getFullYear();
+            for(let y = currentYear; y >= 2018; y--) {
+                const opt = document.createElement('option'); opt.value = y; opt.text = y; selYear.appendChild(opt);
+            }
+            const selMonth = document.getElementById('sel-month');
+            for(let m = 1; m <= 12; m++) {
+                const opt = document.createElement('option'); opt.value = m; opt.text = m; selMonth.appendChild(opt);
+            }
+            updateDayOptions();
+            
+            const selHour = document.getElementById('sel-hour');
+            const selMin = document.getElementById('sel-min');
+            const selSec = document.getElementById('sel-sec');
+            
+            for(let i=0; i<24; i++) {
+                const opt = document.createElement('option'); opt.value = i; opt.text = ('0'+i).slice(-2); selHour.appendChild(opt);
+            }
+            for(let i=0; i<60; i++) {
+                const optM = document.createElement('option'); optM.value = i; optM.text = ('0'+i).slice(-2); selMin.appendChild(optM);
+                const optS = document.createElement('option'); optS.value = i; optS.text = ('0'+i).slice(-2); selSec.appendChild(optS);
+            }
+        }
+
+        function updateDayOptions() {
+            const year = parseInt(document.getElementById('sel-year').value);
+            const month = parseInt(document.getElementById('sel-month').value);
+            const selDay = document.getElementById('sel-day');
+            const currentDay = parseInt(selDay.value) || 1;
+            const lastDay = new Date(year, month, 0).getDate();
+            if (selDay.options.length !== lastDay) {
+                selDay.innerHTML = '';
+                for(let d = 1; d <= lastDay; d++) {
+                    const opt = document.createElement('option'); opt.value = d; opt.text = d; selDay.appendChild(opt);
+                }
+                selDay.value = (currentDay > lastDay) ? lastDay : currentDay;
+            }
+        }
+
+        function setControlsToDate(d) {
+            document.getElementById('sel-year').value = d.getFullYear();
+            document.getElementById('sel-month').value = d.getMonth() + 1;
+            updateDayOptions();
+            document.getElementById('sel-day').value = d.getDate();
+            document.getElementById('sel-hour').value = d.getHours();
+            document.getElementById('sel-min').value = d.getMinutes();
+            document.getElementById('sel-sec').value = d.getSeconds();
+            
+            // Header Info update
+            const Y = d.getFullYear();
+            const M = ('0'+(d.getMonth()+1)).slice(-2);
+            const D = ('0'+d.getDate()).slice(-2);
+            const h = ('0'+d.getHours()).slice(-2);
+            const m = ('0'+d.getMinutes()).slice(-2);
+            const s = ('0'+d.getSeconds()).slice(-2);
+            
+            document.getElementById('data-time').innerText = `${h}:${m}:${s}`;
+            document.getElementById('date-display').innerText = `${Y}/${M}/${D}`;
+        }
+
+        function setPresetTime(minutesAgo) {
+            const d = new Date();
+            d.setMinutes(d.getMinutes() - minutesAgo);
+            setControlsToDate(d);
+        }
+
+        // ==========================================
+        // Replay Control
+        // ==========================================
+        function startReplay() {
+            const y = document.getElementById('sel-year').value;
+            const m = document.getElementById('sel-month').value;
+            const d = document.getElementById('sel-day').value;
+            const h = document.getElementById('sel-hour').value;
+            const mi = document.getElementById('sel-min').value;
+            const s = document.getElementById('sel-sec').value;
+            const targetTime = new Date(y, m - 1, d, h, mi, s);
+            if (isNaN(targetTime.getTime())) { alert("日時エラー"); return; }
+
+            isReplayMode = true; replayCurrentTime = targetTime;
+            
+            // UI Updates
+            document.getElementById('btn-play').classList.add('hidden');
+            document.getElementById('btn-stop').classList.remove('hidden');
+            
+            const badge = document.getElementById('mode-display');
+            badge.className = "glass-panel px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide flex items-center gap-2 text-pink-600 bg-pink-50/90 border-pink-200";
+            badge.innerHTML = `<span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-pink-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-pink-500"></span></span>REPLAY`;
+            
+            if(isMobileMenuOpen) toggleMobileMenu(); // Close menu on mobile to show map
+
+            gridSystem.resetHistory(); 
+            markers.clearLayers(); 
+            eewHandler.clear();
+        }
+
+        function stopReplay() {
+            isReplayMode = false; replayCurrentTime = null;
+            
+            document.getElementById('btn-play').classList.remove('hidden');
+            document.getElementById('btn-stop').classList.add('hidden');
+
+            const badge = document.getElementById('mode-display');
+            badge.className = "glass-panel px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide flex items-center gap-2 text-green-600 bg-green-50/90 border-green-200";
+            badge.innerHTML = `<span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span></span>LIVE`;
+
+            gridSystem.resetHistory(); 
+            markers.clearLayers(); 
+            eewHandler.clear();
+            setControlsToDate(new Date());
+        }
+
+        // ==========================================
+        // Audio
+        // ==========================================
+        let audioCtx = null;
+        let isAudioOn = false;
+        function toggleAudio() {
+            const btn = document.getElementById('btn-audio');
+            if (!isAudioOn) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                isAudioOn = true;
+                btn.innerHTML = '<i class="fa-solid fa-volume-high text-green-500"></i> ON';
+                btn.classList.add('border-green-400', 'bg-green-50');
+                playBeep(880, 0.1);
+            } else {
+                isAudioOn = false;
+                btn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i> OFF';
+                btn.classList.remove('border-green-400', 'bg-green-50');
+            }
+        }
+        function playBeep(freq, duration) {
+            if (!isAudioOn || !audioCtx || freq === 0) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sine'; osc.frequency.value = freq;
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.start();
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        // ==========================================
+        // Utils
+        // ==========================================
+        function getJSTDate(offsetSeconds = 0) {
+            const now = new Date();
+            const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+            const jstMs = utc + (3600000 * 9) - (offsetSeconds * 1000);
+            return new Date(jstMs);
+        }
+        function formatDate(dateObj) {
+            const yyyy = dateObj.getFullYear();
+            const MM = ('0' + (dateObj.getMonth() + 1)).slice(-2);
+            const dd = ('0' + dateObj.getDate()).slice(-2);
+            const HH = ('0' + dateObj.getHours()).slice(-2);
+            const mm = ('0' + dateObj.getMinutes()).slice(-2);
+            const ss = ('0' + dateObj.getSeconds()).slice(-2);
+            return { ymd: `${yyyy}${MM}${dd}`, hms: `${HH}${mm}${ss}`, full: `${MM}/${dd} ${HH}:${mm}:${ss}` };
+        }
+        function yahooToJMA(val) { if (val < 6) return 0; return Math.min(7, Math.floor((val - 6) / 2) + 1); }
+
+        // ==========================================
+        // Core Logic Classes
+        // ==========================================
+        class EEWHandler {
+            constructor(map) {
+                this.map = map;
+                this.layerGroup = L.layerGroup().addTo(map);
+                this.isActive = false;
+            }
+            clear() {
+                this.layerGroup.clearLayers();
+                document.getElementById('eew-banner').classList.add('hidden');
+                this.isActive = false;
+            }
+            parseCoord(str) {
+                if(!str) return null;
+                let val = parseFloat(str.replace(/[NESW]/g, ''));
+                if(str.includes('S') || str.includes('W')) val = -val;
+                return val;
+            }
+            update(data) {
+                if(!data) return;
+                let hypoItems = data.hypoInfo && data.hypoInfo.items;
+                let psItems = data.psWave && data.psWave.items;
+                if (!hypoItems && data.realTimeData) { // Fallback
+                    if (data.realTimeData.hypoInfo) hypoItems = data.realTimeData.hypoInfo.items;
+                }
+                if (!hypoItems || hypoItems.length === 0 || hypoItems[0].isCancel === 'true') {
+                    if (this.isActive) this.clear();
+                    return;
+                }
+
+                const hypo = hypoItems[0];
+                this.isActive = true;
+                this.layerGroup.clearLayers();
+
+                // Draw Epicenter
+                const lat = this.parseCoord(hypo.latitude);
+                const lng = this.parseCoord(hypo.longitude);
+                if (lat !== null && lng !== null) {
+                    const icon = L.divIcon({
+                        className: 'epicenter-icon', html: '<i class="fa-solid fa-xmark"></i>', iconSize: [24, 24], iconAnchor: [12, 12]
+                    });
+                    L.marker([lat, lng], {icon: icon, zIndexOffset: 2000}).addTo(this.layerGroup);
+                }
+
+                // Draw Waves
+                if (psItems && psItems.length > 0) {
+                    const wave = psItems[0];
+                    const wLat = this.parseCoord(wave.latitude);
+                    const wLng = this.parseCoord(wave.longitude);
+                    const pR_km = parseFloat(wave.pRadius);
+                    const sR_km = parseFloat(wave.sRadius);
+                    if (wLat !== null && wLng !== null) {
+                        if(pR_km > 0) L.circle([wLat, wLng], { radius: pR_km * 1000, color: '#0ea5e9', weight: 1, fill: false, opacity: 0.8 }).addTo(this.layerGroup);
+                        if(sR_km > 0) L.circle([wLat, wLng], { radius: sR_km * 1000, color: '#ef4444', weight: 2, fill: true, fillColor: '#ef4444', fillOpacity: 0.1, opacity: 0.8 }).addTo(this.layerGroup);
+                    }
+                }
+
+                // Update UI
+                const banner = document.getElementById('eew-banner');
+                document.getElementById('eew-region').innerText = hypo.regionName;
+                document.getElementById('eew-mag').innerText = hypo.magnitude;
+                document.getElementById('eew-maxint').innerText = hypo.calcintensity;
+                document.getElementById('eew-depth').innerText = hypo.depth;
+                banner.classList.remove('hidden');
+            }
+        }
+
+        class Grid {
+            constructor(id, latIdx, lngIdx, centerLat, centerLng) {
+                this.id = id; this.latIdx = latIdx; this.lngIdx = lngIdx; this.center = [centerLat, centerLng];
+                this.points = []; this.currentMaxYahooVal = 0; this.history = []; this.isTriggered = false; this.rectLayer = null;
+            }
+            addPoint(idx) { this.points.push(idx); }
+            update(values) {
+                let maxVal = -1;
+                for (const idx of this.points) { if (values[idx] !== null && values[idx] > maxVal) maxVal = values[idx]; }
+                if (maxVal === -1) { this.currentMaxYahooVal = 0; return; }
+                this.history.push(maxVal);
+                if (this.history.length > CONFIG.HISTORY_FRAMES) this.history.shift();
+                this.currentMaxYahooVal = maxVal;
+            }
+            checkTrigger() {
+                if (this.history.length < 2) return false;
+                const current = this.history[this.history.length - 1];
+                const pastMin = Math.min(...this.history.slice(0, -1));
+                if (current < CONFIG.MIN_ACTIVITY_THRESHOLD) return false;
+                return (current - pastMin >= CONFIG.RISE_THRESHOLD);
+            }
+            reset() { this.history = []; this.currentMaxYahooVal = 0; this.isTriggered = false; }
+        }
+
+        class GridSystem {
+            constructor(map) {
+                this.map = map; this.grids = new Map();
+                this.layerGroup = L.layerGroup().addTo(map); this.activeEvents = []; this.eventIdCounter = 0;
+            }
+            initGrids(siteList) {
+                this.grids.clear();
+                siteList.forEach((site, index) => {
+                    const lat = site[0]; const lng = site[1];
+                    const latIdx = Math.floor(lat / CONFIG.GRID_SIZE);
+                    const lngIdx = Math.floor(lng / CONFIG.GRID_SIZE);
+                    const id = `${latIdx}_${lngIdx}`;
+                    if (!this.grids.has(id)) {
+                        const cl = (latIdx * CONFIG.GRID_SIZE) + (CONFIG.GRID_SIZE/2);
+                        const cln = (lngIdx * CONFIG.GRID_SIZE) + (CONFIG.GRID_SIZE/2);
+                        this.grids.set(id, new Grid(id, latIdx, lngIdx, cl, cln));
+                    }
+                    this.grids.get(id).addPoint(index);
+                });
+                this.grids.forEach(grid => {
+                    const bounds = [[grid.latIdx * CONFIG.GRID_SIZE, grid.lngIdx * CONFIG.GRID_SIZE], [(grid.latIdx+1) * CONFIG.GRID_SIZE, (grid.lngIdx+1) * CONFIG.GRID_SIZE]];
+                    grid.rectLayer = L.rectangle(bounds, { color: "#fa0", weight: 1, fillOpacity: 0, opacity: 0, className: 'grid-rect' }).addTo(this.layerGroup);
+                });
+            }
+            resetHistory() { this.grids.forEach(grid => grid.reset()); this.activeEvents = []; this.render(); }
+            process(pointValues) {
+                this.grids.forEach(grid => grid.update(pointValues));
+                const triggered = [];
+                this.grids.forEach(grid => {
+                    if (grid.checkTrigger()) { grid.isTriggered = true; triggered.push(grid.id); } else grid.isTriggered = false;
+                });
+                const verified = new Set();
+                triggered.forEach(id => {
+                    const grid = this.grids.get(id);
+                    const neighbors = this.getNeighbors(grid);
+                    const activeN = neighbors.filter(n => n.isTriggered).length;
+                    if (!CONFIG.NOISE_FILTER || activeN >= CONFIG.NEIGHBOR_REQ || grid.currentMaxYahooVal >= 10.0) verified.add(id);
+                });
+                const newClusters = this.clusterGrids(Array.from(verified));
+                this.updateEvents(newClusters);
+                this.render();
+            }
+            getNeighbors(grid) {
+                const d = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+                const n = [];
+                d.forEach(dir => {
+                    const id = `${grid.latIdx+dir[0]}_${grid.lngIdx+dir[1]}`;
+                    if (this.grids.has(id)) n.push(this.grids.get(id));
+                });
+                return n;
+            }
+            clusterGrids(ids) {
+                const visited = new Set(); const clusters = [];
+                ids.forEach(id => {
+                    if (visited.has(id)) return;
+                    const cl = []; const q = [id]; visited.add(id);
+                    while (q.length) {
+                        const cid = q.shift(); cl.push(this.grids.get(cid));
+                        this.getNeighbors(this.grids.get(cid)).forEach(n => {
+                            if (ids.includes(n.id) && !visited.has(n.id)) { visited.add(n.id); q.push(n.id); }
+                        });
+                    }
+                    clusters.push(cl);
+                });
+                return clusters;
+            }
+            updateEvents(newClusters) {
+                const activeNow = [];
+                newClusters.forEach(cluster => {
+                    let maxVal = 0; let ls = 0, lns = 0;
+                    cluster.forEach(g => {
+                        if (g.currentMaxYahooVal > maxVal) maxVal = g.currentMaxYahooVal;
+                        ls += g.center[0]; lns += g.center[1];
+                    });
+                    const center = [ls/cluster.length, lns/cluster.length];
+                    let lo = EVENT_LEVELS.PRE; let lk = "PRE";
+                    if (maxVal>=EVENT_LEVELS.SHINDO5.min){lo=EVENT_LEVELS.SHINDO5;lk="Shindo5";}
+                    else if (maxVal>=EVENT_LEVELS.SHINDO4.min){lo=EVENT_LEVELS.SHINDO4;lk="Shindo4";}
+                    else if (maxVal>=EVENT_LEVELS.SHINDO3.min){lo=EVENT_LEVELS.SHINDO3;lk="Shindo3";}
+                    else if (maxVal>=EVENT_LEVELS.SHINDO2.min){lo=EVENT_LEVELS.SHINDO2;lk="Shindo2";}
+                    else if (maxVal>=EVENT_LEVELS.SHINDO1.min){lo=EVENT_LEVELS.SHINDO1;lk="Shindo1";}
+
+                    let matched = null;
+                    for (let evt of this.activeEvents) {
+                        if (Math.abs(evt.center[0]-center[0]) + Math.abs(evt.center[1]-center[1]) < 2.0) { matched = evt; break; }
+                    }
+                    if (matched) {
+                        matched.grids = cluster; matched.center = center; matched.currentMaxVal = maxVal;
+                        if (maxVal > matched.maxHistoryVal) {
+                            matched.maxHistoryVal = maxVal;
+                            if (this.getLvl(lk) > this.getLvl(matched.levelKey)) { matched.levelKey = lk; matched.levelObj = lo; this.playAlert(lo); }
+                        }
+                        activeNow.push(matched);
+                    } else {
+                        const ne = { id: ++this.eventIdCounter, grids: cluster, center: center, maxHistoryVal: maxVal, currentMaxVal: maxVal, levelKey: lk, levelObj: lo };
+                        this.playAlert(lo); activeNow.push(ne);
+                    }
+                });
+                this.activeEvents = activeNow;
+            }
+            getLvl(k) { return ["PRE","SHINDO1","SHINDO2","SHINDO3","SHINDO4","SHINDO5"].indexOf(k); }
+            playAlert(lo) { if (lo.soundFreq > 0) playBeep(lo.soundFreq, 0.8); }
+            render() {
+                this.grids.forEach(g => g.rectLayer.setStyle({opacity:0, fillOpacity:0}));
+                const el = document.getElementById('event-list');
+                const valid = this.activeEvents.filter(e => e.levelKey !== 'PRE');
+                if (!valid.length) el.innerHTML = `<div class="text-slate-400 text-center py-4 text-xs">検知なし</div>`;
+                else {
+                    el.innerHTML = "";
+                    valid.forEach(evt => {
+                        evt.grids.forEach(g => {
+                            let c = '#94a3b8', o = 0.3;
+                            if (g.currentMaxYahooVal>=10) {c='#2563eb';o=0.5;}
+                            else if (g.currentMaxYahooVal>=6) {c='#0ea5e9';o=0.4;}
+                            g.rectLayer.setStyle({color:c, weight:2, opacity:0.8, fillColor:c, fillOpacity:o});
+                        });
+                        const div = document.createElement('div');
+                        div.className = `p-3 rounded-lg border shadow-sm ${evt.levelObj.tailwind}`;
+                        div.innerHTML = `
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="font-bold text-sm uppercase">${evt.levelObj.label}</span>
+                                <span class="text-[10px] opacity-80">ID:${evt.id}</span>
+                            </div>
+                            <div class="text-xs opacity-90">
+                                範囲: ${evt.grids.length} グリッド
+                            </div>
+                        `;
+                        el.appendChild(div);
+                    });
+                }
+            }
+        }
+
+        // ==========================================
+        // Main Loop
+        // ==========================================
+        const map = L.map('map', { preferCanvas: true, zoomControl: false }).setView([38.0, 138.0], 5);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; CARTO', maxZoom: 19 }).addTo(map);
+        const markers = L.layerGroup().addTo(map);
+        const gridSystem = new GridSystem(map);
+        const eewHandler = new EEWHandler(map);
+        let siteList = [];
+
+        async function fetchSiteList() {
+            try {
+                const r = await fetch('https://weather-kyoshin.west.edge.storage-yahoo.jp/SiteList/sitelist.json');
+                const d = await r.json();
+                siteList = d.items || [];
+                gridSystem.initGrids(siteList);
+                initSelectors();
+                setControlsToDate(new Date());
+            } catch (e) { console.error("SiteList Error"); }
+        }
+
+        async function fetchRealTimeData() {
+            if (siteList.length === 0) return;
+            let targetDateObj = null; let isReplay = false;
+
+            if (isReplayMode && replayCurrentTime) { targetDateObj = replayCurrentTime; isReplay = true; } 
+            else { targetDateObj = getJSTDate(2); isReplay = false; }
+
+            const fmt = formatDate(targetDateObj);
+            
+            // Header Update
+            document.getElementById('data-time').innerText = `${fmt.hms.slice(0,2)}:${fmt.hms.slice(2,4)}:${fmt.hms.slice(4,6)}`;
+            document.getElementById('date-display').innerText = `${fmt.ymd.slice(0,4)}/${fmt.ymd.slice(4,6)}/${fmt.ymd.slice(6,8)}`;
+
+            let url = `https://weather-kyoshin.west.edge.storage-yahoo.jp/RealTimeData/${fmt.ymd}/${fmt.ymd}${fmt.hms}.json`;
+            const statusEl = document.getElementById('fetch-status');
+
+            try {
+                let res = await fetch(url);
+                if (!isReplay && !res.ok && res.status === 404) {
+                    const fallbackDate = getJSTDate(3); const fallbackFmt = formatDate(fallbackDate);
+                    url = `https://weather-kyoshin.west.edge.storage-yahoo.jp/RealTimeData/${fallbackFmt.ymd}/${fallbackFmt.ymd}${fallbackFmt.hms}.json`;
+                    res = await fetch(url);
+                }
+                if (!res.ok) {
+                    statusEl.innerText = isReplay ? `データなし` : `受信エラー`;
+                    if (isReplay) { replayCurrentTime.setSeconds(replayCurrentTime.getSeconds() + 1); setControlsToDate(replayCurrentTime); }
+                    eewHandler.clear();
+                    return;
+                }
+
+                const json = await res.json();
+                const intensityData = json.realTimeData || json;
+                statusEl.innerText = "受信中";
+
+                if (intensityData.intensity) processData(intensityData.intensity);
+                eewHandler.update(json);
+
+                if (isReplay) {
+                    replayCurrentTime.setSeconds(replayCurrentTime.getSeconds() + 1);
+                    setControlsToDate(replayCurrentTime);
+                }
+            } catch (e) { statusEl.innerText = "通信待機"; }
+        }
+
+        function processData(intensityStr) {
+            const pointValues = new Array(siteList.length).fill(null);
+            let listHtml = ''; markers.clearLayers();
+            let count = 0;
+            const len = Math.min(intensityStr.length, siteList.length);
+            for (let i = 0; i < len; i++) {
+                const val = intensityStr.charCodeAt(i) - 100;
+                if (val < -20 || val > 100) { pointValues[i] = 0; continue; }
+                pointValues[i] = val;
+                const jma = yahooToJMA(Math.max(0, val));
+                if (jma >= 1) {
+                    let c = '#97b7cc';
+                    if(jma===2)c='#00a0e9'; if(jma===3)c='#0040ff'; if(jma===4)c='#fa0'; if(jma>=5)c='#ff2800';
+                    L.circleMarker(siteList[i], {radius:4, fillColor:c, color:'transparent', fillOpacity:0.9}).addTo(markers);
+                    listHtml += `
+                    <div class="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
+                        <span class="text-xs text-slate-600 font-mono">Site ${i}</span>
+                        <span class="text-[10px] font-bold px-1.5 py-0.5 rounded text-white" style="background:${c}">震度${jma}</span>
+                    </div>`;
+                    count++;
+                }
+            }
+            document.getElementById('intensity-content').innerHTML = listHtml || `<div class="text-slate-400 text-center py-4 text-xs">観測なし</div>`;
+            document.getElementById('site-count').innerText = count;
+            gridSystem.process(pointValues);
+        }
+
+        (async function() { await fetchSiteList(); setInterval(fetchRealTimeData, CONFIG.UPDATE_INTERVAL); })();
+    </script>
+</body>
+</html>
